@@ -6,6 +6,16 @@ use std::sync::mpsc;
 use std::io::{self, Read, Write};
 
 const MSG_SIZE: usize = 100;
+const CHAT_SIZE: usize = 20;
+
+struct Chatter {
+    stream: Option<TcpStream>,
+}
+
+struct Msg {
+    data: String,
+    sender: usize,
+}
 
 fn main() {
     println!("Chatroom server:");
@@ -22,16 +32,23 @@ fn main() {
     // Setup server listener
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(addr).unwrap();
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::channel::<Msg>();
     let senders = Arc::new(Mutex::new(vec![]));
+    for _ in 0..CHAT_SIZE {
+        senders.lock().unwrap().push(Chatter{stream: None});
+    }
+
+    // Create sender thread
     {
-        let senders: Arc<Mutex<Vec<TcpStream>>> = senders.clone();
+        let senders = senders.clone();
         thread::spawn(move || loop {
             let msg = rx.recv().unwrap();
-            print!("{}", msg);
+            print!("{}", msg.data);
             io::stdout().flush().unwrap();  // Need to flush the stdout
-            for s in senders.lock().unwrap().iter_mut() {
-                s.write_all("abc123".as_bytes()).expect("Unable to write");
+            for (idx, s) in senders.lock().unwrap().iter_mut().enumerate() {
+                if idx != msg.sender && s.stream.is_some() {
+                    s.stream.as_ref().unwrap().write_all(msg.data.as_bytes()).expect("Unable to send msg");
+                }
             }
         });
     }
@@ -40,21 +57,37 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                senders.lock().unwrap().push(stream.try_clone().unwrap());
+                let mut slot = 0;
+                for (idx, s) in senders.lock().unwrap().iter_mut().enumerate() {
+                    if (*s).stream.is_none() {
+                        (*s).stream = Some(stream.try_clone().unwrap());
+                        slot = idx;
+                        break;
+                    }
+                }
                 println!("Connected by {}", stream.peer_addr().unwrap());
                 let tx = tx.clone();
-                thread::spawn(move || {
-                    let mut buf = [0; MSG_SIZE];
-                    loop {
-                        match stream.read(&mut buf) {
-                            Ok(size) => {
-                                let msg = String::from_utf8(buf[..size].to_vec()).expect("Invalid message");
+                {
+                    let senders = senders.clone();
+                    thread::spawn(move || {
+                        let mut buf = [0; MSG_SIZE];
+                        let slot = slot;
+                        loop {
+                            let size = stream.read(&mut buf).expect("Receiving data error.");
+                            if size != 0 {
+                                let msg = Msg {
+                                    data: String::from_utf8(buf[..size].to_vec()).expect("Invalid message"),
+                                    sender: slot,
+                                };
                                 tx.send(msg).expect("Internal error");
-                            },
-                            Err(_) => {}
+                            } else {
+                                println!("Disconnected");
+                                senders.lock().unwrap()[slot].stream = None;
+                                break;
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
             Err(e) => {
                 println!("Error connection: {}", e);
