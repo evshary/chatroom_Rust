@@ -2,13 +2,24 @@ use std::env;
 use async_std::net::{TcpListener, TcpStream};
 use async_std::task;
 use async_std::prelude::*;
-use std::sync::{Arc, Mutex};
+use futures::channel::mpsc;
+use std::sync::Arc;
+use std::collections::HashMap;
 
 const MSG_SIZE: usize = 100;
-const CHAT_SIZE: usize = 20;
 
-struct Chatter {
-    stream: Option<TcpStream>,
+enum Msg {
+    New {
+        sender: Arc<Box<String>>,
+        stream: TcpStream,
+    },
+    Close {
+        sender: Arc<Box<String>>,
+    },
+    Data {
+        sender: Arc<Box<String>>,
+        payload: String,
+    },
 }
 
 #[async_std::main]
@@ -27,33 +38,45 @@ async fn main() {
     // Setup server listener
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(addr).await.unwrap();
-    let senders = Arc::new(Mutex::new(vec![]));
-    for _ in 0..CHAT_SIZE {
-        senders.lock().unwrap().push(Chatter{stream: None});
-    }
+    let (tx, mut rx) = mpsc::unbounded::<Msg>();
+    task::spawn(async move {
+        let mut hash = HashMap::new();
+        loop {
+            let event = rx.next().await.unwrap();
+            match event {
+                Msg::New { sender, stream } => {
+                    hash.insert(sender, stream);
+                },
+                Msg::Data { sender, payload } => {
+                    for (name, mut stream) in &hash {
+                        if *name != sender {
+                            stream.write_all(payload.as_bytes()).await.unwrap();
+                        }
+                    }
+                },
+                Msg::Close { sender } => {
+                    hash.remove(&sender);
+                },
+            }
+        }
+    });
 
     while let Some(stream) = listener.incoming().next().await {
         let mut stream = stream.unwrap();
-        let mut slot = 0;
-        for (idx, s) in senders.lock().unwrap().iter_mut().enumerate() {
-            if (*s).stream.is_none() {
-                (*s).stream = Some(stream.clone());
-                slot = idx;
-                break;
-            }
-        }
-        let senders = senders.clone();
+        let tx = tx.clone();
         task::spawn(async move {
-            println!("Connected by {}", stream.peer_addr().unwrap());
+            let name = Arc::new(Box::new(format!("{}", stream.peer_addr().unwrap())));
+            println!("Connected by {}", name);
+            tx.unbounded_send(Msg::New { sender: name.clone(), stream: stream.clone() }).unwrap();
             let mut buf = [0; MSG_SIZE];
             loop {
                 let size = stream.read(&mut buf).await.unwrap();
                 if size != 0 {
-                    println!("{}", String::from_utf8(buf[..size].to_vec()).unwrap());
-                    for (idx, s) in senders.lock().unwrap().iter_mut().enumerate() {}
+                    print!("{}", String::from_utf8(buf[..size].to_vec()).unwrap());
+                    tx.unbounded_send(Msg::Data { sender: name.clone(), payload: String::from_utf8(buf[..size].to_vec()).unwrap() }).unwrap();
                 } else {
-                    println!("Disconnected");
-                    senders.lock().unwrap()[slot].stream = None;
+                    println!("{} is disconnected", name);
+                    tx.unbounded_send(Msg::Close { sender: name.clone() }).unwrap();
                     break;
                 }
             }
